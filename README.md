@@ -1,6 +1,6 @@
 # 设备遥测接收 API（device-telemetry-ingest）
 
-基于 **FastAPI + SQLite** 的本地设备遥测接收服务。设备按批次上报带递增序列号的遥测记录，批次可能乱序到达；服务为每台设备维护一个**滑动窗口**，实现乱序暂存、重复幂等丢弃、超时断档标记与断档重放，并在并发请求下保持状态一致。另支持**连续阈值告警**：按设备配置规则，对已提交记录按序检测连续越限并生成可查询告警。
+基于 **FastAPI + SQLite** 的本地设备遥测接收服务。设备按批次上报带递增序列号的遥测记录，批次可能乱序到达；服务为每台设备维护一个**滑动窗口**，实现乱序暂存、重复幂等丢弃、超时断档标记与断档重放，并在并发请求下保持状态一致。另支持**连续阈值告警**：按设备配置规则，对已提交记录按序检测连续越限并生成可查询告警；每条告警携带 `open`/`acknowledged` 状态，可通过**幂等确认接口**由确认人标记为已确认（记录确认人与确认时间，重复确认不改变首次确认信息）。
 
 ## 快速启动
 
@@ -27,7 +27,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 服务信息/当前配置 | `http://localhost:8000/` |
 | 端口 | `8000`（Compose 映射 `8000:8000`，可在 `docker-compose.yml` 修改） |
 
-SQLite 数据库文件默认在容器内 `/data/telemetry.db`，Compose 通过命名卷 `telemetry-data` 持久化。
+SQLite 数据库文件默认在容器内 `/data/telemetry.db`，Compose 通过命名卷 `telemetry-data` 持久化。升级到带告警确认工作流的镜像时，启动初始化会自动为旧库的 `alerts` 表补齐 `status`/`acknowledged_by`/`acknowledged_at` 列（历史告警视为 `open`），无需手动迁移；但请仍按惯例在升级前备份卷内数据库。
 
 ## 配置项（环境变量）
 
@@ -70,10 +70,16 @@ SQLite 数据库文件默认在容器内 `/data/telemetry.db`，Compose 通过�
 同一连续区段不再重复生成；待计数中断（恢复正常）后，下一段连续越限才会再次触发。
 规则创建前已提交的历史记录不回溯计算。
 
+**告警确认工作流**：每条告警生成时状态为 `open`，并带 `acknowledged_by`/`acknowledged_at`
+两个空字段。运维方可按告警 ID 调用确认接口，将其置为 `acknowledged` 并记录**确认人标识**
+与**服务端确认时间**。确认接口**幂等**：重复确认（无论是否换人）都返回当前记录，
+首次确认人与确认时间**永不改变**。
+
 **并发一致性**：每请求一个 SQLite 连接（WAL 模式 + `busy_timeout`），所有状态变更包裹在
 `BEGIN IMMEDIATE` 写事务中，写操作在数据库层面串行化；同步端点运行在线程池中，
 配合每序列号幂等，并发/重试/乱序下状态保持一致。告警状态与产生它的记录状态变更
-在同一事务内提交。
+在同一事务内提交。告警确认使用“仅当 `status = 'open'` 才更新”的条件 UPDATE，
+并发确认在数据库层串行化，恰好一个请求完成首次确认，其余请求读到一致的已确认记录。
 
 ## API 一览
 
@@ -225,10 +231,21 @@ GET /api/v1/devices/{device_id}/alert-rules
 ```
 GET /api/v1/devices/{device_id}/alerts
 GET /api/v1/devices/{device_id}/alerts?rule_id=1
+GET /api/v1/devices/{device_id}/alerts?status=open
+GET /api/v1/devices/{device_id}/alerts?rule_id=1&status=acknowledged
 ```
 
-`rule_id` 可选过滤。每条告警记录越限区段的 `start_seq`/`end_seq`（end 为达到连续条数
-的那条记录）、触发值 `trigger_value` 及规则快照（field/op/threshold/consecutive）：
+`rule_id` 与 `status` 均为可选过滤，可组合使用：
+
+| 参数 | 说明 |
+|---|---|
+| `rule_id` | 仅返回该规则产生的告警 |
+| `status` | `open`（未确认）/ `acknowledged`（已确认）；不传则保留**全部历史** |
+
+每条告警记录越限区段的 `start_seq`/`end_seq`（end 为达到连续条数
+的那条记录）、触发值 `trigger_value`、规则快照（field/op/threshold/consecutive）
+以及确认工作流字段（`status`、`acknowledged_by`、`acknowledged_at`）。
+过滤只筛选行，响应始终保留告警的全部字段：
 
 ```json
 {
@@ -245,9 +262,52 @@ GET /api/v1/devices/{device_id}/alerts?rule_id=1
       "start_seq": 1,
       "end_seq": 3,
       "trigger_value": 33.0,
-      "created_at": 1758000000.34
+      "created_at": 1758000000.34,
+      "status": "open",
+      "acknowledged_by": null,
+      "acknowledged_at": null
     }
   ]
+}
+```
+
+### 确认告警
+
+```
+POST /api/v1/devices/{device_id}/alerts/{alert_id}/acknowledge
+```
+
+请求体（`acknowledged_by` 为必填的确认人标识，1–128 字符）：
+
+```json
+{"acknowledged_by": "ops-alice"}
+```
+
+- 首次确认：告警 `open` → `acknowledged`，记录确认人与服务端确认时间，返回 `200` 与完整告警。
+- **重复确认幂等**：对同一告警再次调用（即使换成另一个确认人）仍返回 `200` 与当前记录，
+  首次确认的 `acknowledged_by`/`acknowledged_at` 不会被修改。
+- **并发安全**：多个确认请求同时到达时，`BEGIN IMMEDIATE` 事务与条件更新保证恰好一次
+  首次确认生效，所有响应的确认人/确认时间一致。
+- 告警 ID 不属于该设备（含不存在）返回 `404`；请求体校验失败返回 `422`。
+
+确认后响应示例：
+
+```json
+{
+  "alert_id": 1,
+  "rule_id": 1,
+  "device_id": "dev-001",
+  "field": "temp",
+  "op": "gt",
+  "threshold": 30.0,
+  "consecutive": 3,
+  "start_seq": 1,
+  "end_seq": 3,
+  "trigger_value": 33.0,
+  "created_at": 1758000000.34,
+  "status": "acknowledged",
+  "acknowledged_by": "ops-alice",
+  "acknowledged_at": 1758000012.80
 }
 ```
 
@@ -306,10 +366,20 @@ curl -X POST localhost:8000/api/v1/batches -H 'Content-Type: application/json' -
               {"seq":9,"payload":{"temp":33}}]
 }'
 curl localhost:8000/api/v1/devices/dev-001/alerts
-# -> alerts[0]: start_seq=7, end_seq=9, trigger_value=33.0
+# -> alerts[0]: start_seq=7, end_seq=9, trigger_value=33.0, status=open
 #    同一连续区段不再重复告警；恢复正常（未越限/字段缺失/声明断档）后才可再次触发
 
-# 10. 查看规则实时状态（streak/alerted）
+# 10. 确认告警：记录确认人与确认时间；重复/并发确认幂等，首次确认信息不变
+curl -X POST localhost:8000/api/v1/devices/dev-001/alerts/1/acknowledge \
+  -H 'Content-Type: application/json' \
+  -d '{"acknowledged_by":"ops-alice"}'
+# -> 200 {"alert_id": 1, "status": "acknowledged",
+#         "acknowledged_by": "ops-alice", "acknowledged_at": 1758000012.8, ...}
+# 仅看待确认 / 已确认告警：
+curl 'localhost:8000/api/v1/devices/dev-001/alerts?status=open'
+curl 'localhost:8000/api/v1/devices/dev-001/alerts?status=acknowledged'
+
+# 11. 查看规则实时状态（streak/alerted）
 curl localhost:8000/api/v1/devices/dev-001/alert-rules
 ```
 
@@ -349,3 +419,7 @@ pytest tests/ -q
 恢复正常后再次触发、字段缺失/非数值中断计数、buffered 冲刷逐条按序计算、
 重复批次不重复计数、stale/out_of_window 不参与、声明断档中断连续计数、
 断档补录不回溯重算、规则创建前历史不回溯、多规则独立评估。
+告警确认工作流：新告警默认 open 且确认字段为空、首次确认记录确认人与时间且保留全部
+历史字段、重复确认幂等且不改首次确认信息（换人也不可覆盖）、按状态筛选（可与 rule_id
+组合，非法值 422）、未知/跨设备告警 404、请求体校验、旧版 SQLite 库启动自动迁移，
+以及真实 uvicorn 服务下 16 并发确认单条告警时唯一确认人胜出、所有响应与落库状态一致。

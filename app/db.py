@@ -73,10 +73,30 @@ CREATE TABLE IF NOT EXISTS alerts (
     start_seq     INTEGER NOT NULL,         -- first seq of the violating run
     end_seq       INTEGER NOT NULL,         -- seq at which the run reached `consecutive`
     trigger_value REAL NOT NULL,            -- field value of the triggering record
-    created_at    REAL NOT NULL
+    created_at    REAL NOT NULL,
+    -- Acknowledgement workflow: every alert is born 'open' and can be
+    -- acknowledged exactly once; the first confirmation's identity/timestamp
+    -- are frozen for the lifetime of the row.
+    status          TEXT NOT NULL DEFAULT 'open'
+                    CHECK (status IN ('open', 'acknowledged')),
+    acknowledged_by TEXT,                   -- identifier of the first confirmer
+    acknowledged_at REAL                    -- server time of the first confirmation
 );
 CREATE INDEX IF NOT EXISTS idx_alerts_device ON alerts(device_id, id);
 """
+
+# Idempotent column migrations for databases created before the alerts table
+# gained the acknowledgement columns (e.g. an existing Docker /data volume).
+# Safe to re-run: columns already present are skipped.
+ALERT_COLUMN_MIGRATIONS = (
+    (
+        "status",
+        "ALTER TABLE alerts ADD COLUMN status TEXT NOT NULL DEFAULT 'open' "
+        "CHECK (status IN ('open', 'acknowledged'))",
+    ),
+    ("acknowledged_by", "ALTER TABLE alerts ADD COLUMN acknowledged_by TEXT"),
+    ("acknowledged_at", "ALTER TABLE alerts ADD COLUMN acknowledged_at REAL"),
+)
 
 
 def connect(db_path: str) -> sqlite3.Connection:
@@ -101,8 +121,22 @@ def init_db(db_path: str) -> None:
     conn = connect(db_path)
     try:
         conn.executescript(SCHEMA)
+        _migrate_alert_columns(conn)
     finally:
         conn.close()
+
+
+def _migrate_alert_columns(conn: sqlite3.Connection) -> None:
+    """Add acknowledgement columns to a pre-workflow alerts table, once."""
+    existing = {r["name"] for r in conn.execute("PRAGMA table_info(alerts)").fetchall()}
+    for name, ddl in ALERT_COLUMN_MIGRATIONS:
+        if name not in existing:
+            conn.execute(ddl)
+    # Created only after the columns above certainly exist, so an old alerts
+    # table migrated in the same startup cannot fail the index build.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_alerts_device_status ON alerts(device_id, status)"
+    )
 
 
 @contextmanager

@@ -104,6 +104,21 @@ class AlertOut(BaseModel):
     end_seq: int         # seq at which the run reached the consecutive count
     trigger_value: float
     created_at: float
+    # Acknowledgement workflow. New alerts are 'open'; the first confirmation
+    # switches them to 'acknowledged' and freezes acknowledged_by/at. All
+    # historical fields above remain present on every response.
+    status: Literal["open", "acknowledged"]
+    acknowledged_by: Optional[str] = None
+    acknowledged_at: Optional[float] = None
+
+
+class AlertAckIn(BaseModel):
+    acknowledged_by: str = Field(
+        min_length=1, max_length=128,
+        description="Identifier of the operator/system confirming the alert "
+        "(user id, service account, etc.). Recorded only on the first "
+        "confirmation; repeated calls are idempotent and ignore it.",
+    )
 
 
 class AlertList(BaseModel):

@@ -101,17 +101,53 @@ class AlertEngine:
     # ------------------------------------------------------------------ #
     # alert queries
     # ------------------------------------------------------------------ #
-    def list_alerts(self, device_id: str, rule_id: Optional[int] = None) -> list[dict]:
+    def list_alerts(
+        self,
+        device_id: str,
+        rule_id: Optional[int] = None,
+        status: Optional[str] = None,
+    ) -> list[dict]:
+        clauses = ["device_id = ?"]
+        params: list = [device_id]
         if rule_id is not None:
-            rows = self.conn.execute(
-                "SELECT * FROM alerts WHERE device_id = ? AND rule_id = ? ORDER BY id",
-                (device_id, rule_id),
-            ).fetchall()
-        else:
-            rows = self.conn.execute(
-                "SELECT * FROM alerts WHERE device_id = ? ORDER BY id", (device_id,)
-            ).fetchall()
+            clauses.append("rule_id = ?")
+            params.append(rule_id)
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status)
+        rows = self.conn.execute(
+            f"SELECT * FROM alerts WHERE {' AND '.join(clauses)} ORDER BY id", params
+        ).fetchall()
         return [self._alert_dict(r) for r in rows]
+
+    def get_alert(self, device_id: str, alert_id: int) -> Optional[dict]:
+        """Fetch one device-scoped alert, or None when it does not exist."""
+        row = self.conn.execute(
+            "SELECT * FROM alerts WHERE device_id = ? AND id = ?",
+            (device_id, alert_id),
+        ).fetchone()
+        return self._alert_dict(row) if row is not None else None
+
+    def acknowledge_alert(
+        self, device_id: str, alert_id: int, acknowledged_by: str, now: float
+    ) -> Optional[dict]:
+        """Idempotently confirm an alert.
+
+        Runs inside the caller's BEGIN IMMEDIATE transaction: the conditional
+        UPDATE claims the alert only while it is still 'open', so concurrent
+        confirmations serialize on the row and exactly one wins. A repeated
+        call matches no row and simply returns the stored record — the first
+        confirmer's identity and timestamp can never be rewritten.
+        """
+        cur = self.conn.execute(
+            "UPDATE alerts SET status = 'acknowledged', acknowledged_by = ?, "
+            "acknowledged_at = ? WHERE device_id = ? AND id = ? AND status = 'open'",
+            (acknowledged_by, now, device_id, alert_id),
+        )
+        # When cur.rowcount == 0 the alert either does not exist (handled by
+        # the following lookup -> None) or was already acknowledged (the
+        # existing row is returned untouched).
+        return self.get_alert(device_id, alert_id)
 
     @staticmethod
     def _alert_dict(row) -> dict:
@@ -127,6 +163,9 @@ class AlertEngine:
             "end_seq": row["end_seq"],
             "trigger_value": row["trigger_value"],
             "created_at": row["created_at"],
+            "status": row["status"],
+            "acknowledged_by": row["acknowledged_by"],
+            "acknowledged_at": row["acknowledged_at"],
         }
 
     # ------------------------------------------------------------------ #

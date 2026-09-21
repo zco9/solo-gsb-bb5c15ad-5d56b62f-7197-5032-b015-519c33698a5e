@@ -22,7 +22,9 @@ from .config import Settings
 from .cursor import Cursor, CursorError, decode_cursor, encode_cursor
 from .db import connect, init_db, write_txn
 from .models import (
+    AlertAckIn,
     AlertList,
+    AlertOut,
     AlertRuleIn,
     AlertRuleList,
     AlertRuleOut,
@@ -66,8 +68,9 @@ def create_app(settings: Settings) -> FastAPI:
         title="Device Telemetry Ingest API",
         version="1.0.0",
         description="Local telemetry receiver with per-device sliding-window "
-        "ordering, idempotent dedup, gap (断档) detection and replay, and "
-        "consecutive-threshold alerting on committed records.",
+        "ordering, idempotent dedup, gap (断档) detection and replay, "
+        "consecutive-threshold alerting on committed records, and an "
+        "idempotent alert acknowledgement workflow.",
         lifespan=lifespan,
     )
     app.state.settings = settings
@@ -330,11 +333,45 @@ def create_app(settings: Settings) -> FastAPI:
     def list_alerts(
         device_id: str,
         rule_id: Optional[int] = Query(default=None, ge=1),
+        status: Optional[str] = Query(
+            default=None,
+            pattern="^(open|acknowledged)$",
+            description="Filter by acknowledgement state; omit to keep the full history.",
+        ),
         conn=Depends(get_conn),
     ):
         return AlertList(
-            device_id=device_id, alerts=AlertEngine(conn).list_alerts(device_id, rule_id)
+            device_id=device_id,
+            alerts=AlertEngine(conn).list_alerts(device_id, rule_id, status),
         )
+
+    @app.post(
+        f"{API_PREFIX}/devices/{{device_id}}/alerts/{{alert_id}}/acknowledge",
+        response_model=AlertOut,
+    )
+    def acknowledge_alert(
+        device_id: str,
+        alert_id: int,
+        ack: AlertAckIn,
+        conn=Depends(get_conn),
+    ):
+        """Idempotently acknowledge one alert.
+
+        The first call transitions `open` -> `acknowledged` and records the
+        confirmer and server time. Repeating the call (same or a different
+        confirmer) is a no-op that returns the current record; the first
+        confirmation's fields are never overwritten. BEGIN IMMEDIATE plus the
+        conditional row update make concurrent confirmations race-free.
+        """
+        with write_txn(conn):
+            alert = AlertEngine(conn).acknowledge_alert(
+                device_id, alert_id, ack.acknowledged_by, time.time()
+            )
+        if alert is None:
+            raise HTTPException(
+                status_code=404, detail=f"alert {alert_id} not found for {device_id}"
+            )
+        return alert
 
     return app
 

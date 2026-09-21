@@ -1,6 +1,7 @@
 """Consecutive-threshold alerting: rule CRUD, streak semantics, gap interplay."""
 from __future__ import annotations
 
+import socket
 import time
 
 import pytest
@@ -306,3 +307,261 @@ def test_alerts_listing_and_rule_filter(client):
     assert alerts(client, rule_id=rule["rule_id"]) == body["alerts"]
     assert alerts(client, rule_id=999) == []
     assert alerts(client, "unknown-device") == []
+
+
+# --------------------------------------------------------------------- #
+# acknowledgement workflow
+# --------------------------------------------------------------------- #
+
+# Every historical field that existed before the workflow; acknowledgement
+# must never drop or rename any of them.
+ALERT_HISTORY_FIELDS = {
+    "alert_id", "rule_id", "device_id", "field", "op", "threshold",
+    "consecutive", "start_seq", "end_seq", "trigger_value", "created_at",
+}
+
+
+def make_alert(client, device="dev-a"):
+    create_rule(client, device=device, consecutive=2)
+    submit(client, device, [1, 2])
+    return alerts(client, device)[0]
+
+
+def ack(client, alert_id, by="ops-alice", device="dev-a"):
+    resp = client.post(
+        f"/api/v1/devices/{device}/alerts/{alert_id}/acknowledge",
+        json={"acknowledged_by": by},
+    )
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+def test_new_alert_is_born_open_with_null_ack_fields(client):
+    alert = make_alert(client)
+    assert alert["status"] == "open"
+    assert alert["acknowledged_by"] is None
+    assert alert["acknowledged_at"] is None
+    # every pre-workflow field is still present
+    assert ALERT_HISTORY_FIELDS <= set(alert)
+
+
+def test_acknowledge_records_confirmer_and_time(client):
+    alert = make_alert(client)
+    before = time.time()
+    result = ack(client, alert["alert_id"], by="ops-alice")
+    after = time.time()
+
+    assert result["status"] == "acknowledged"
+    assert result["acknowledged_by"] == "ops-alice"
+    assert before <= result["acknowledged_at"] <= after
+    assert ALERT_HISTORY_FIELDS <= set(result)
+    # historical fields are untouched by the confirmation
+    for key in ALERT_HISTORY_FIELDS:
+        assert result[key] == alert[key]
+
+    # the list endpoint shows the persisted state, still with all fields
+    listed = alerts(client)[0]
+    assert listed == result
+
+
+def test_repeated_acknowledgement_is_idempotent_and_keeps_first_confirmation(client):
+    alert = make_alert(client)
+    first = ack(client, alert["alert_id"], by="ops-alice")
+
+    # a retry (even from a different confirmer) returns the current record
+    # and must not overwrite the first confirmation
+    second = ack(client, alert["alert_id"], by="ops-bob")
+    third = ack(client, alert["alert_id"], by="ops-alice")
+    for repeated in (second, third):
+        assert repeated == first
+        assert repeated["acknowledged_by"] == "ops-alice"
+        assert repeated["acknowledged_at"] == first["acknowledged_at"]
+
+    assert alerts(client)[0] == first
+
+
+def test_status_filter_lists_open_and_acknowledged(client):
+    create_rule(client, consecutive=1)
+    # two independent violating runs -> two alerts
+    submit(client, "dev-a", [1])
+    submit(client, "dev-a", [2], value=10.0)  # recovery re-arms the rule
+    submit(client, "dev-a", [3])
+    assert [a["alert_id"] for a in alerts(client)] == [1, 2]
+
+    # default (no filter) keeps the whole history
+    assert [a["status"] for a in alerts(client)] == ["open", "open"]
+    ack(client, 1, by="ops-alice")
+
+    assert [a["alert_id"] for a in alerts(client, status="open")] == [2]
+    assert [a["alert_id"] for a in alerts(client, status="acknowledged")] == [1]
+    got = alerts(client, status="acknowledged")[0]
+    assert got["acknowledged_by"] == "ops-alice"
+    assert ALERT_HISTORY_FIELDS <= set(got)
+
+    # status composes with rule_id; invalid status is a validation error
+    assert alerts(client, rule_id=1, status="acknowledged")[0]["alert_id"] == 1
+    resp = client.get("/api/v1/devices/dev-a/alerts", params={"status": "closed"})
+    assert resp.status_code == 422
+
+
+def test_acknowledge_unknown_or_other_device_alert_404(client):
+    alert = make_alert(client, device="dev-a")
+    assert client.post(
+        "/api/v1/devices/dev-a/alerts/999/acknowledge",
+        json={"acknowledged_by": "ops-alice"},
+    ).status_code == 404
+    # alert 1 belongs to dev-a; the same id under another device is unknown
+    assert client.post(
+        f"/api/v1/devices/other/alerts/{alert['alert_id']}/acknowledge",
+        json={"acknowledged_by": "ops-alice"},
+    ).status_code == 404
+    # and the failed lookup must not have changed the alert
+    assert alerts(client)[0]["status"] == "open"
+
+
+def test_acknowledge_request_validation(client):
+    make_alert(client)
+    path = "/api/v1/devices/dev-a/alerts/1/acknowledge"
+    assert client.post(path, json={}).status_code == 422
+    assert client.post(path, json={"acknowledged_by": ""}).status_code == 422
+    assert client.post(path, json={"acknowledged_by": "x" * 129}).status_code == 422
+    assert client.post(path, json={"acknowledged_by": 123}).status_code == 422
+    assert alerts(client)[0]["status"] == "open"
+
+
+def test_pre_workflow_database_is_migrated(tmp_path):
+    """An existing DB whose alerts table predates the workflow must gain the
+    acknowledgement columns on startup (e.g. an old Docker /data volume)."""
+    import sqlite3
+
+    from app.db import connect, init_db
+
+    path = str(tmp_path / "old.db")
+    with sqlite3.connect(path) as raw:
+        raw.execute(
+            "CREATE TABLE alert_rules (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "device_id TEXT, field TEXT, op TEXT, threshold REAL, "
+            "consecutive INTEGER, created_at REAL)"
+        )
+        raw.execute(
+            "CREATE TABLE alerts (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "rule_id INTEGER, device_id TEXT, field TEXT, op TEXT, "
+            "threshold REAL, consecutive INTEGER, start_seq INTEGER, "
+            "end_seq INTEGER, trigger_value REAL, created_at REAL)"
+        )
+        raw.execute(
+            "INSERT INTO alerts (rule_id, device_id, field, op, threshold, "
+            "consecutive, start_seq, end_seq, trigger_value, created_at) "
+            "VALUES (1, 'dev-a', 'temp', 'gt', 30, 2, 1, 2, 40, 1.0)"
+        )
+
+    init_db(path)  # adds status / acknowledged_by / acknowledged_at
+    init_db(path)  # migration is idempotent
+
+    conn = connect(path)
+    try:
+        row = conn.execute("SELECT * FROM alerts WHERE id = 1").fetchone()
+        assert row["status"] == "open"
+        assert row["acknowledged_by"] is None
+        assert row["acknowledged_at"] is None
+    finally:
+        conn.close()
+
+    # the migrated row behaves like any open alert through the API
+    settings = Settings(db_path=path, sweep_enabled=False)
+    with TestClient(create_app(settings)) as c:
+        resp = c.post(
+            "/api/v1/devices/dev-a/alerts/1/acknowledge",
+            json={"acknowledged_by": "ops-alice"},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "acknowledged"
+
+
+# --------------------------------------------------------------------- #
+# concurrent acknowledgement: real server, parallel confirmations
+# --------------------------------------------------------------------- #
+
+def _free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def test_concurrent_acknowledgements_have_one_consistent_winner(tmp_path):
+    import socket
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    import httpx
+    import uvicorn
+
+    settings = Settings(
+        db_path=str(tmp_path / "conc_ack.db"),
+        window_size=50,
+        gap_timeout_seconds=600,
+        sweep_enabled=False,
+    )
+    port = _free_port()
+    config = uvicorn.Config(create_app(settings), host="127.0.0.1", port=port,
+                            log_level="error")
+    server = uvicorn.Server(config)
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{port}"
+    try:
+        for _ in range(100):
+            try:
+                httpx.get(f"{base}/health", timeout=0.2)
+                break
+            except Exception:
+                time.sleep(0.05)
+        else:
+            pytest.fail("server did not start")
+
+        with httpx.Client(base_url=base, timeout=10) as c:
+            r = c.post(
+                "/api/v1/devices/dev-a/alert-rules",
+                json={"field": "temp", "op": "gt", "threshold": 30.0,
+                      "consecutive": 2},
+            )
+            assert r.status_code == 201, r.text
+            r = c.post(
+                "/api/v1/batches",
+                json={"device_id": "dev-a",
+                      "records": [{"seq": s, "payload": {"temp": 40}} for s in (1, 2)]},
+            )
+            assert r.status_code == 200, r.text
+
+        def confirm(worker: int):
+            with httpx.Client(base_url=base, timeout=10) as c:
+                r = c.post(
+                    "/api/v1/devices/dev-a/alerts/1/acknowledge",
+                    json={"acknowledged_by": f"ops-{worker}"},
+                )
+                assert r.status_code == 200, r.text
+                return r.json()
+
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            results = list(pool.map(confirm, range(16)))
+
+        # every racer saw the same record; exactly one confirmer won and its
+        # identity/time are identical across all responses and the list view
+        winners = {(r["acknowledged_by"], r["acknowledged_at"]) for r in results}
+        assert len(winners) == 1
+        assert all(r["status"] == "acknowledged" for r in results)
+        assert len({r["alert_id"] for r in results}) == 1
+
+        with httpx.Client(base_url=base, timeout=10) as c:
+            stored = c.get("/api/v1/devices/dev-a/alerts").json()["alerts"][0]
+            assert (stored["acknowledged_by"], stored["acknowledged_at"]) == next(iter(winners))
+            assert (
+                c.get("/api/v1/devices/dev-a/alerts",
+                      params={"status": "open"}).json()["alerts"] == []
+            )
+            assert len(c.get(
+                "/api/v1/devices/dev-a/alerts",
+                params={"status": "acknowledged"}).json()["alerts"]) == 1
+    finally:
+        server.should_exit = True
+        thread.join(timeout=5)
