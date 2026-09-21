@@ -104,6 +104,17 @@ class AlertOut(BaseModel):
     end_seq: int         # seq at which the run reached the consecutive count
     trigger_value: float
     created_at: float
+    status: Literal["open", "acknowledged"] = "open"
+    acknowledged_by: Optional[str] = None   # set at first acknowledgment, never rewritten
+    acknowledged_at: Optional[float] = None
+
+
+class AlertAckIn(BaseModel):
+    acknowledged_by: str = Field(
+        min_length=1, max_length=256,
+        description="Identifier of the operator/system confirming the alert; "
+        "only the first acknowledgment's value is retained",
+    )
 
 
 class AlertList(BaseModel):

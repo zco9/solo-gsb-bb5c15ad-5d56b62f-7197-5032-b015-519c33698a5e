@@ -73,10 +73,26 @@ CREATE TABLE IF NOT EXISTS alerts (
     start_seq     INTEGER NOT NULL,         -- first seq of the violating run
     end_seq       INTEGER NOT NULL,         -- seq at which the run reached `consecutive`
     trigger_value REAL NOT NULL,            -- field value of the triggering record
-    created_at    REAL NOT NULL
+    created_at    REAL NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'open'
+                  CHECK (status IN ('open', 'acknowledged')),
+    acknowledged_by   TEXT,                 -- who acknowledged it (NULL while open)
+    acknowledged_at   REAL                  -- first acknowledgment time (NULL while open)
 );
 CREATE INDEX IF NOT EXISTS idx_alerts_device ON alerts(device_id, id);
+-- idx_alerts_device_status is created in _migrate_alerts, after any upgrade
+-- from an older schema that predates the `status` column.
 """
+
+# Columns added after the initial release; existing databases (e.g. a Docker
+# volume created by an older image) get them via idempotent ALTER TABLE.
+# CHECK is intentionally omitted here (older SQLite builds reject a CHECK on
+# ADD COLUMN); the fresh schema above carries the constraint for new databases.
+ALERT_ADDED_COLUMNS = (
+    ("status", "ALTER TABLE alerts ADD COLUMN status TEXT NOT NULL DEFAULT 'open'"),
+    ("acknowledged_by", "ALTER TABLE alerts ADD COLUMN acknowledged_by TEXT"),
+    ("acknowledged_at", "ALTER TABLE alerts ADD COLUMN acknowledged_at REAL"),
+)
 
 
 def connect(db_path: str) -> sqlite3.Connection:
@@ -101,8 +117,24 @@ def init_db(db_path: str) -> None:
     conn = connect(db_path)
     try:
         conn.executescript(SCHEMA)
+        _migrate_alerts(conn)
     finally:
         conn.close()
+
+
+def _migrate_alerts(conn: sqlite3.Connection) -> None:
+    """Bring an older `alerts` table up to date with the acknowledgment columns.
+
+    Runs on every startup and only adds columns that are missing, so it is safe
+    both against fresh databases and across restarts with a persisted volume.
+    """
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(alerts)")}
+    for column, statement in ALERT_ADDED_COLUMNS:
+        if column not in existing:
+            conn.execute(statement)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_alerts_device_status ON alerts(device_id, status)"
+    )
 
 
 @contextmanager

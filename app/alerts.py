@@ -101,17 +101,50 @@ class AlertEngine:
     # ------------------------------------------------------------------ #
     # alert queries
     # ------------------------------------------------------------------ #
-    def list_alerts(self, device_id: str, rule_id: Optional[int] = None) -> list[dict]:
+    def list_alerts(
+        self,
+        device_id: str,
+        rule_id: Optional[int] = None,
+        status: Optional[str] = None,
+    ) -> list[dict]:
+        clauses = ["device_id = ?"]
+        params: list = [device_id]
         if rule_id is not None:
-            rows = self.conn.execute(
-                "SELECT * FROM alerts WHERE device_id = ? AND rule_id = ? ORDER BY id",
-                (device_id, rule_id),
-            ).fetchall()
-        else:
-            rows = self.conn.execute(
-                "SELECT * FROM alerts WHERE device_id = ? ORDER BY id", (device_id,)
-            ).fetchall()
+            clauses.append("rule_id = ?")
+            params.append(rule_id)
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status)
+        rows = self.conn.execute(
+            f"SELECT * FROM alerts WHERE {' AND '.join(clauses)} ORDER BY id", params
+        ).fetchall()
         return [self._alert_dict(r) for r in rows]
+
+    def get_alert(self, alert_id: int) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM alerts WHERE id = ?", (alert_id,)
+        ).fetchone()
+        return self._alert_dict(row) if row is not None else None
+
+    def acknowledge_alert(
+        self, alert_id: int, acknowledged_by: str, now: float
+    ) -> Optional[dict]:
+        """Idempotently acknowledge an alert.
+
+        The conditional UPDATE flips exactly one still-open row; concurrent
+        requests therefore serialize through the write transaction and only
+        one of them performs the transition. Repeated or racing calls simply
+        re-read the stored row, so the first confirmer and timestamp are
+        immutable. Returns None when no alert with this id exists.
+        """
+        cur = self.conn.execute(
+            "UPDATE alerts SET status = 'acknowledged', acknowledged_by = ?, "
+            "acknowledged_at = ? WHERE id = ? AND status = 'open'",
+            (acknowledged_by, now, alert_id),
+        )
+        if cur.rowcount == 0 and self.get_alert(alert_id) is None:
+            return None
+        return self.get_alert(alert_id)
 
     @staticmethod
     def _alert_dict(row) -> dict:
@@ -127,6 +160,9 @@ class AlertEngine:
             "end_seq": row["end_seq"],
             "trigger_value": row["trigger_value"],
             "created_at": row["created_at"],
+            "status": row["status"],
+            "acknowledged_by": row["acknowledged_by"],
+            "acknowledged_at": row["acknowledged_at"],
         }
 
     # ------------------------------------------------------------------ #

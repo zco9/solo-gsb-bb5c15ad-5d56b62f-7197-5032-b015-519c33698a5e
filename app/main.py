@@ -22,7 +22,9 @@ from .config import Settings
 from .cursor import Cursor, CursorError, decode_cursor, encode_cursor
 from .db import connect, init_db, write_txn
 from .models import (
+    AlertAckIn,
     AlertList,
+    AlertOut,
     AlertRuleIn,
     AlertRuleList,
     AlertRuleOut,
@@ -330,11 +332,40 @@ def create_app(settings: Settings) -> FastAPI:
     def list_alerts(
         device_id: str,
         rule_id: Optional[int] = Query(default=None, ge=1),
+        status: Optional[str] = Query(
+            default=None,
+            pattern="^(open|acknowledged)$",
+            description="Filter by acknowledgment state; omit to keep full history",
+        ),
         conn=Depends(get_conn),
     ):
         return AlertList(
-            device_id=device_id, alerts=AlertEngine(conn).list_alerts(device_id, rule_id)
+            device_id=device_id,
+            alerts=AlertEngine(conn).list_alerts(device_id, rule_id, status),
         )
+
+    @app.post(
+        f"{API_PREFIX}/alerts/{{alert_id}}/acknowledge",
+        response_model=AlertOut,
+    )
+    def acknowledge_alert(
+        alert_id: int,
+        ack: AlertAckIn,
+        conn=Depends(get_conn),
+    ):
+        """Idempotently acknowledge a single alert.
+
+        The first call flips `open` -> `acknowledged` and pins the confirmer
+        and timestamp. Repeated and concurrent calls return the stored record
+        unchanged — the first acknowledgment's metadata is never overwritten.
+        """
+        with write_txn(conn):
+            alert = AlertEngine(conn).acknowledge_alert(
+                alert_id, ack.acknowledged_by, time.time()
+            )
+        if alert is None:
+            raise HTTPException(status_code=404, detail=f"alert {alert_id} not found")
+        return alert
 
     return app
 

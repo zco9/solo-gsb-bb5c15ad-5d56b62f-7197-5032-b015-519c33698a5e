@@ -28,6 +28,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 端口 | `8000`（Compose 映射 `8000:8000`，可在 `docker-compose.yml` 修改） |
 
 SQLite 数据库文件默认在容器内 `/data/telemetry.db`，Compose 通过命名卷 `telemetry-data` 持久化。
+容器启动时自动建表；旧版本镜像留下的数据库会在启动时幂等补齐新增列（如告警的
+`status`/`acknowledged_by`/`acknowledged_at`），既有告警默认按 `open` 处理，无需手工迁移。
 
 ## 配置项（环境变量）
 
@@ -69,6 +71,12 @@ SQLite 数据库文件默认在容器内 `/data/telemetry.db`，Compose 通过�
 非数值**时连续计数中断（streak 清零并重新待命）。连续越限首次达到 N 条时生成一条告警，
 同一连续区段不再重复生成；待计数中断（恢复正常）后，下一段连续越限才会再次触发。
 规则创建前已提交的历史记录不回溯计算。
+
+**告警确认（acknowledgment）**：每条告警生成时为 `open` 状态，携带确认人标识与确认时间
+两个字段（未确认时为 `null`）。确认接口按**告警 ID 幂等**：首次确认将状态置为
+`acknowledged` 并记录确认人与时间；重复确认（含不同确认人）直接返回当前记录，**首次确认
+信息永不被覆盖**。确认操作同样在 `BEGIN IMMEDIATE` 写事务中以条件更新完成，并发确认请求
+在数据库层串行化，单条告警的最终状态保持一致。告警历史不会因确认而删除。
 
 **并发一致性**：每请求一个 SQLite 连接（WAL 模式 + `busy_timeout`），所有状态变更包裹在
 `BEGIN IMMEDIATE` 写事务中，写操作在数据库层面串行化；同步端点运行在线程池中，
@@ -225,10 +233,15 @@ GET /api/v1/devices/{device_id}/alert-rules
 ```
 GET /api/v1/devices/{device_id}/alerts
 GET /api/v1/devices/{device_id}/alerts?rule_id=1
+GET /api/v1/devices/{device_id}/alerts?status=open
+GET /api/v1/devices/{device_id}/alerts?rule_id=1&status=acknowledged
 ```
 
-`rule_id` 可选过滤。每条告警记录越限区段的 `start_seq`/`end_seq`（end 为达到连续条数
-的那条记录）、触发值 `trigger_value` 及规则快照（field/op/threshold/consecutive）：
+`rule_id`、`status` 均为可选过滤：`status` 取 `open`（未确认）或
+`acknowledged`（已确认），**不传则保留全部历史**（含全部原始字段，按告警 ID 升序）。
+每条告警记录越限区段的 `start_seq`/`end_seq`（end 为达到连续条数
+的那条记录）、触发值 `trigger_value`、规则快照（field/op/threshold/consecutive）
+以及确认状态：
 
 ```json
 {
@@ -245,11 +258,30 @@ GET /api/v1/devices/{device_id}/alerts?rule_id=1
       "start_seq": 1,
       "end_seq": 3,
       "trigger_value": 33.0,
-      "created_at": 1758000000.34
+      "created_at": 1758000000.34,
+      "status": "acknowledged",
+      "acknowledged_by": "ops-alice",
+      "acknowledged_at": 1758000060.0
     }
   ]
 }
 ```
+
+### 确认告警
+
+```
+POST /api/v1/alerts/{alert_id}/acknowledge
+```
+
+```json
+{"acknowledged_by": "ops-alice"}
+```
+
+按告警 ID **幂等确认**。首次确认：状态 `open` → `acknowledged`，记录确认人标识
+（非空，1–256 字符）与确认时间，返回更新后的告警记录（HTTP 200）。重复确认
+（即使换一个确认人）返回当前已保存的记录，**首次确认人/时间不变**。告警不存在返回
+**404**；请求体缺少 `acknowledged_by`、为空或超长返回 **422**。并发确认同一告警时，
+仅一个请求完成状态翻转，其余请求读到的都是同一条已确认记录。
 
 ### 其他
 
@@ -311,6 +343,18 @@ curl localhost:8000/api/v1/devices/dev-001/alerts
 
 # 10. 查看规则实时状态（streak/alerted）
 curl localhost:8000/api/v1/devices/dev-001/alert-rules
+
+# 11. 确认告警（幂等）：首次确认记录确认人与时间；重复确认不改首次信息
+curl -X POST localhost:8000/api/v1/alerts/1/acknowledge \
+  -H 'Content-Type: application/json' \
+  -d '{"acknowledged_by":"ops-alice"}'
+# -> {"alert_id": 1, "status": "acknowledged", "acknowledged_by": "ops-alice", ...}
+curl -X POST localhost:8000/api/v1/alerts/1/acknowledge \
+  -H 'Content-Type: application/json' \
+  -d '{"acknowledged_by":"ops-bob"}'   # 仍返回 ops-alice 的首次确认记录
+
+# 12. 按状态筛选；不传 status 时保留全部历史字段
+curl 'localhost:8000/api/v1/devices/dev-001/alerts?status=open'
 ```
 
 ## 项目结构
@@ -320,14 +364,14 @@ app/
   config.py   # 环境变量配置
   db.py       # SQLite 连接、建表、写事务（WAL + BEGIN IMMEDIATE）
   window.py   # 滑动窗口核心引擎（提交/暂存/断档/重放/回锚）
-  alerts.py   # 连续阈值告警引擎（规则推进/断档中断/告警生成）
+  alerts.py   # 连续阈值告警引擎（规则推进/断档中断/告警生成/幂等确认）
   cursor.py   # HMAC 签名的不透明分页游标（高水位 + 键集位置）
   models.py   # 请求/响应模型
   main.py     # FastAPI 应用、路由、后台断档扫描器
 tests/
   test_api.py     # 乱序/幂等/断档/重放/回锚/并发一致性测试
   test_records.py # 一致性分页：快照隔离/游标篡改/跨设备/区间变更测试
-  test_alerts.py  # 连续阈值告警：规则 CRUD/连续计数/断档中断/补录不重算测试
+  test_alerts.py  # 连续阈值告警：规则 CRUD/连续计数/断档中断/补录不重算/确认工作流测试
 Dockerfile
 docker-compose.yml
 requirements.txt / requirements-dev.txt
@@ -348,4 +392,8 @@ pytest tests/ -q
 连续阈值告警：规则创建/校验/列表、gt/lt 越限判定、首次达 N 条生成告警且同区段不重复、
 恢复正常后再次触发、字段缺失/非数值中断计数、buffered 冲刷逐条按序计算、
 重复批次不重复计数、stale/out_of_window 不参与、声明断档中断连续计数、
-断档补录不回溯重算、规则创建前历史不回溯、多规则独立评估。
+断档补录不回溯重算、规则创建前历史不回溯、多规则独立评估；
+告警确认：新告警默认 open 且带全部确认字段、首次确认翻转状态并固化确认人/时间、
+重复确认（换确认人）返回原记录不改首次信息、未知告警 404、确认人校验 422、
+按状态筛选（含与 rule_id 组合，默认返回全部历史）、10 条告警 20 个并发请求下状态一致，
+以及旧 schema 数据库启动时的幂等列迁移。

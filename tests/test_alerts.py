@@ -1,7 +1,9 @@
 """Consecutive-threshold alerting: rule CRUD, streak semantics, gap interplay."""
 from __future__ import annotations
 
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from fastapi.testclient import TestClient
@@ -306,3 +308,144 @@ def test_alerts_listing_and_rule_filter(client):
     assert alerts(client, rule_id=rule["rule_id"]) == body["alerts"]
     assert alerts(client, rule_id=999) == []
     assert alerts(client, "unknown-device") == []
+
+
+# --------------------------------------------------------------------- #
+# acknowledgment workflow
+# --------------------------------------------------------------------- #
+
+def acknowledge(client, alert_id, by="ops-alice"):
+    resp = client.post(
+        f"/api/v1/alerts/{alert_id}/acknowledge",
+        json={"acknowledged_by": by},
+    )
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+def make_alert(client, device="dev-a", consecutive=1):
+    create_rule(client, device=device, consecutive=consecutive)
+    submit(client, device, list(range(1, consecutive + 1)))
+    return alerts(client, device)[0]
+
+
+def test_new_alert_starts_open_with_ack_history_fields(client):
+    alert = make_alert(client)
+    # all history fields are present, including the new acknowledgment ones
+    assert set(alert) == {
+        "alert_id", "rule_id", "device_id", "field", "op", "threshold",
+        "consecutive", "start_seq", "end_seq", "trigger_value", "created_at",
+        "status", "acknowledged_by", "acknowledged_at",
+    }
+    assert alert["status"] == "open"
+    assert alert["acknowledged_by"] is None
+    assert alert["acknowledged_at"] is None
+
+
+def test_acknowledge_flips_state_and_pins_metadata(client):
+    alert = make_alert(client)
+    acked = acknowledge(client, alert["alert_id"], by="ops-alice")
+    assert acked["status"] == "acknowledged"
+    assert acked["acknowledged_by"] == "ops-alice"
+    assert isinstance(acked["acknowledged_at"], float)
+    assert acked["acknowledged_at"] >= acked["created_at"]
+    # history fields survive the transition
+    for key in ("rule_id", "start_seq", "end_seq", "trigger_value", "created_at"):
+        assert acked[key] == alert[key]
+
+
+def test_repeat_acknowledgment_is_idempotent_and_keeps_first_ack_info(client):
+    alert = make_alert(client)
+    first = acknowledge(client, alert["alert_id"], by="ops-alice")
+    time.sleep(0.005)
+    # a different confirmer retries: response is the stored record, unchanged
+    second = acknowledge(client, alert["alert_id"], by="ops-bob")
+    assert second == first
+    assert second["status"] == "acknowledged"
+    assert second["acknowledged_by"] == "ops-alice"
+    assert second["acknowledged_at"] == first["acknowledged_at"]
+    # the list endpoint agrees
+    listed = alerts(client)[0]
+    assert listed["status"] == "acknowledged"
+    assert listed["acknowledged_by"] == "ops-alice"
+    assert listed["acknowledged_at"] == first["acknowledged_at"]
+
+
+def test_acknowledge_unknown_alert_404(client):
+    resp = client.post(
+        "/api/v1/alerts/999/acknowledge", json={"acknowledged_by": "ops-alice"}
+    )
+    assert resp.status_code == 404
+
+
+def test_acknowledgment_validates_confirmer(client):
+    alert = make_alert(client)
+    for bad in ({}, {"acknowledged_by": ""}, {"acknowledged_by": "x" * 257}):
+        resp = client.post(
+            f"/api/v1/alerts/{alert['alert_id']}/acknowledge", json=bad
+        )
+        assert resp.status_code == 422, bad
+    # rejected payloads never acknowledged anything
+    assert alerts(client)[0]["status"] == "open"
+
+
+def test_alert_list_status_filter(client):
+    make_alert(client)                 # alert 1, open
+    acknowledge(client, 1, by="ops-alice")
+    # create a second alert: rule re-arms after a normal record, then fires again
+    submit(client, "dev-a", [2], value=10.0)
+    submit(client, "dev-a", [3])
+    open_alerts = alerts(client, status="open")
+    acked_alerts = alerts(client, status="acknowledged")
+    assert [a["alert_id"] for a in open_alerts] == [2]
+    assert [a["alert_id"] for a in acked_alerts] == [1]
+    # default (no filter) keeps the full history in id order
+    assert [a["alert_id"] for a in alerts(client)] == [1, 2]
+    # status composes with rule_id
+    assert alerts(client, rule_id=1, status="open") == open_alerts
+    assert alerts(client, status="acknowledged")[0]["acknowledged_by"] == "ops-alice"
+
+
+def test_invalid_status_filter_rejected(client):
+    resp = client.get("/api/v1/devices/dev-a/alerts", params={"status": "resolved"})
+    assert resp.status_code == 422
+
+
+def test_concurrent_acknowledgments_stay_consistent(client):
+    # many alerts, hammered by parallel requests with distinct confirmer ids
+    create_rule(client, consecutive=1)
+    # alternating violating/normal values produce one alert per violating seq
+    entries = []
+    for seq in range(1, 21):
+        entries.append((seq, {"temp": 40.0 if seq % 2 else 10.0}))
+    submit_payloads(client, "dev-a", entries)
+    alert_ids = [a["alert_id"] for a in alerts(client)]
+    assert len(alert_ids) == 10
+
+    barrier = threading.Barrier(len(alert_ids) * 2)
+
+    def hammer(alert_id: int, confirmer: str):
+        barrier.wait()
+        return acknowledge(client, alert_id, by=confirmer)
+
+    # 20 tasks wait together on the barrier, so the pool needs that many workers
+    with ThreadPoolExecutor(max_workers=20) as pool:
+        futures = []
+        for alert_id in alert_ids:
+            futures.append(pool.submit(hammer, alert_id, f"worker-{alert_id}-a"))
+            futures.append(pool.submit(hammer, alert_id, f"worker-{alert_id}-b"))
+        results = [f.result() for f in futures]
+
+    for alert_id in alert_ids:
+        per_alert = [r for r in results if r["alert_id"] == alert_id]
+        assert len(per_alert) == 2
+        # both racing calls observed the same committed record
+        assert per_alert[0] == per_alert[1]
+        assert per_alert[0]["status"] == "acknowledged"
+        assert per_alert[0]["acknowledged_at"] is not None
+        assert per_alert[0]["acknowledged_by"] in (
+            f"worker-{alert_id}-a", f"worker-{alert_id}-b"
+        )
+
+    assert len(alerts(client, status="acknowledged")) == 10
+    assert alerts(client, status="open") == []
